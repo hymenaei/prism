@@ -12,9 +12,9 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    PromptButton, PromptLevel, RawMouseMotionEvent, RequestFrameOptions, SharedString, Size,
+    SystemWindowTab, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -22,7 +22,9 @@ use image::RgbaImage;
 use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::base::CFEqual;
 use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
-use core_graphics::display::CGDirectDisplayID;
+use core_graphics::display::{
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGMainDisplayID, CGPoint,
+};
 use ctor::ctor;
 use foreign_types::ForeignTypeRef;
 use futures::channel::oneshot;
@@ -34,12 +36,12 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSBackingStoreType, NSBeep, NSButton as Objc2NSButton,
-    NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEventModifierFlags, NSEventType,
-    NSRequestUserAttentionType, NSScreen, NSView as Objc2NSView, NSViewLayerContentsRedrawPolicy,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow as Objc2NSWindow,
-    NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSAlert, NSAlertStyle, NSBackingStoreType, NSBeep, NSButton as Objc2NSButton, NSCursor,
+    NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEvent, NSEventModifierFlags,
+    NSEventType, NSRequestUserAttentionType, NSScreen, NSView as Objc2NSView,
+    NSViewLayerContentsRedrawPolicy, NSVisualEffectMaterial, NSVisualEffectState,
+    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSRange,
@@ -635,6 +637,10 @@ unsafe fn build_window_class(
             window_did_change_key_status as unsafe extern "C" fn(_, _, _),
         );
         decl.add_method(
+            sel!(windowDidMiniaturize:),
+            window_did_miniaturize as unsafe extern "C" fn(_, _, _),
+        );
+        decl.add_method(
             sel!(windowShouldClose:),
             window_should_close as unsafe extern "C" fn(_, _, _) -> _,
         );
@@ -819,6 +825,7 @@ struct MacWindowState {
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
+    cursor_capture: Option<Objc2NSPoint>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
@@ -1111,6 +1118,42 @@ impl MacWindowState {
             WindowBounds::Windowed(self.bounds())
         }
     }
+
+    fn capture_cursor(&mut self) {
+        if self.cursor_capture.is_some() || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        unsafe {
+            if self.native_window.isKeyWindow() != Bool::new(true) {
+                return;
+            }
+            let restore = self.native_window.mouseLocationOutsideOfEventStream();
+            if CGDisplay::associate_mouse_and_mouse_cursor_position(false).is_err() {
+                return;
+            }
+            NSCursor::hide();
+            self.cursor_visible.store(false, Ordering::Relaxed);
+            self.cursor_capture = Some(restore);
+        }
+    }
+
+    fn release_cursor(&mut self) {
+        let Some(restore) = self.cursor_capture.take() else {
+            return;
+        };
+        unsafe {
+            if !self.closed.load(Ordering::Acquire) {
+                let screen_point: Objc2NSPoint =
+                    msg_send![self.native_window, convertPointToScreen: restore];
+                let primary_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+                let point = CGPoint::new(screen_point.x, primary_height - screen_point.y);
+                let _ = CGDisplay::warp_mouse_cursor_position(point);
+            }
+            let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+            NSCursor::unhide();
+            self.cursor_visible.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 unsafe impl Send for MacWindowState {}
@@ -1260,6 +1303,7 @@ impl MacWindow {
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
+                cursor_capture: None,
                 frame_source: None,
                 renderer,
                 force_render_pending: false,
@@ -1527,6 +1571,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        this.release_cursor();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -2179,6 +2224,14 @@ impl PlatformWindow for MacWindow {
             .renderer
             .gpu_context_info()
             .map(|context| Box::new(context) as Box<dyn std::any::Any>)
+    }
+
+    fn capture_cursor(&self) {
+        self.0.lock().capture_cursor();
+    }
+
+    fn release_cursor(&self) {
+        self.0.lock().release_cursor();
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -2934,20 +2987,43 @@ unsafe extern "C" fn handle_view_event(this: &Objc2Object, _: Sel, native_event:
         }
         _ => {}
     }
+    if lock.cursor_capture.is_some()
+        && matches!(
+            native_event_type,
+            NSEventType::MouseMoved
+                | NSEventType::LeftMouseDragged
+                | NSEventType::RightMouseDragged
+                | NSEventType::OtherMouseDragged
+        )
+    {
+        let native_event: &NSEvent = unsafe { &*native_event.cast::<NSEvent>() };
+        let delta = point(native_event.deltaX() as f64, native_event.deltaY() as f64);
+        if delta.x != 0.0 || delta.y != 0.0 {
+            let event = PlatformInput::RawMouseMotion(RawMouseMotionEvent { delta });
+            if let Some(mut callback) = lock.event_callback.take() {
+                drop(lock);
+                callback(event);
+                window_state.lock().event_callback = Some(callback);
+            }
+        }
+        return;
+    }
     let event = unsafe { platform_input_from_native(native_event.cast(), Some(window_height)) };
 
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
-        if matches!(
-            event,
-            PlatformInput::MouseMove(_)
-                | PlatformInput::MouseDown(_)
-                | PlatformInput::MouseUp(_)
-                | PlatformInput::MousePressure(_)
-                | PlatformInput::MouseExited(_)
-                | PlatformInput::ScrollWheel(_)
-                | PlatformInput::Pinch(_)
-        ) {
+        if lock.cursor_capture.is_none()
+            && matches!(
+                event,
+                PlatformInput::MouseMove(_)
+                    | PlatformInput::MouseDown(_)
+                    | PlatformInput::MouseUp(_)
+                    | PlatformInput::MousePressure(_)
+                    | PlatformInput::MouseExited(_)
+                    | PlatformInput::ScrollWheel(_)
+                    | PlatformInput::Pinch(_)
+            )
+        {
             lock.cursor_visible.store(true, Ordering::Relaxed);
         }
 
@@ -3195,11 +3271,16 @@ unsafe extern "C" fn window_did_change_screen(this: &Objc2Object, _: Sel, _: Obj
 
 unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: Sel, _: ObjcId) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == Bool::new(true) };
+    if !is_active {
+        lock.release_cursor();
+    }
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
-    lock.cursor_visible.store(true, Ordering::Relaxed);
+    if lock.cursor_capture.is_none() {
+        lock.cursor_visible.store(true, Ordering::Relaxed);
+    }
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
     // `windowDidBecomeKey` message to the previous key window even though that window
@@ -3276,6 +3357,11 @@ unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: 
         .detach();
 }
 
+unsafe extern "C" fn window_did_miniaturize(this: &Objc2Object, _: Sel, _: ObjcId) {
+    let window_state = unsafe { get_window_state(this) };
+    window_state.lock().release_cursor();
+}
+
 unsafe extern "C" fn window_should_close(this: &Objc2Object, _: Sel, _: ObjcId) -> Bool {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -3294,6 +3380,7 @@ unsafe extern "C" fn close_window(this: &Objc2Object, _: Sel) {
         let (close_callback, simple_fullscreen_state) = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
+            lock.release_cursor();
             lock.closed.store(true, Ordering::Release);
             (
                 lock.close_callback.take(),
